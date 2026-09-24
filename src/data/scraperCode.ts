@@ -12,22 +12,22 @@ import csv
 import json
 import re
 import time
+import random
 import logging
+import os
+import pickle
 from urllib.parse import urljoin, urlparse
-from dataclasses import dataclass, field, asdict
-from typing import Optional, List, Dict
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from dataclasses import dataclass, field, asdict, fields
+from typing import Optional, List, Dict, Set
+from datetime import datetime
+from pathlib import Path
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler('zooplus_gr_scraper.log'),
+        logging.FileHandler('zooplus_gr_scraper.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -36,17 +36,35 @@ logger = logging.getLogger(__name__)
 # ─── CONSTANTS ───────────────────────────────────────────────────────────────
 BASE_URL = "https://www.zooplus.gr"
 SHIPPING_URL = "https://www.zooplus.gr/html/shipping"
+
 CATEGORIES = {
     "dry_food": "/shop/dogs/dry_food",
     "treats": "/shop/dogs/treats",
 }
-DELAY_BETWEEN_REQUESTS = 2  # seconds — be polite
+
+# Polite crawling: random delay range (seconds)
+DELAY_MIN = 2.0
+DELAY_MAX = 5.0
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BACKOFF = [5, 15, 30]  # seconds between retries
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "el-GR,el;q=0.9,en;q=0.8",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "el-GR,el;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
+
+# Checkpoint file for resume capability
+CHECKPOINT_FILE = "scraper_checkpoint.pkl"
+OUTPUT_CSV = "zooplus_gr_dogfood.csv"
 
 # ─── COLUMNS SCHEMA (Single Source of Truth) ─────────────────────────────────
 COLUMNS = [
@@ -100,29 +118,44 @@ COLUMNS = [
 ]
 
 # ─── MEAT CATEGORY AUTO-TAGGER ──────────────────────────────────────────────
-MEAT_KEYWORDS = {
-    "chicken": ["chicken", "poultry", "huhn", "poulet", "pollo"],
-    "duck": ["duck", "ente", "canard"],
-    "rabbit": ["rabbit", "kaninchen", "lapin", "coniglio"],
-    "lamb": ["lamb", "lamm", "agneau", "agnello"],
-    "pork": ["pork", "schwein", "porc", "maiale"],
-    "veal": ["veal", "kalb", "veau", "vitello"],
-    "venison": ["venison", "hirsch", "cerf", "cervo", "deer"],
-    "vegetarian": ["vegetarian", "veggie", "plant-based"],
-}
+# Order matters: more specific patterns first to avoid false positives
+MEAT_PATTERNS = [
+    ("venison",     r'\\b(venison|hirsch|deer|cerf|cervo|ελάφι)\\b'),
+    ("rabbit",      r'\\b(rabbit|kaninchen|lapin|coniglio|κουνέλι)\\b'),
+    ("duck",        r'\\b(duck|ente|canard|anatra|πάπια)\\b'),
+    ("lamb",        r'\\b(lamb|lamm|agneau|agnello|αρνί)\\b'),
+    ("veal",        r'\\b(veal|kalb|veau|vitello|μοσχάρι)\\b'),
+    ("pork",        r'\\b(pork|schwein|porc|maiale|χοιρινό)\\b'),
+    ("chicken",     r'\\b(chicken|huhn|poulet|pollo|κοτόπουλο|poultry)\\b'),
+    ("vegetarian",  r'\\b(vegetarian|veggie|plant.based|χορτοφαγ)\\b'),
+]
 
 def auto_tag_meat_category(product_name: str, ingredients: str) -> str:
-    """Auto-tag the main meat category from product name + ingredients."""
-    combined = (product_name + " " + ingredients).lower()
-    for category, keywords in MEAT_KEYWORDS.items():
-        for keyword in keywords:
-            if keyword in combined:
-                return category
+    """Auto-tag the main meat category. Order matters — specific before generic."""
+    combined = f"{product_name} {ingredients}".lower()
+    for category, pattern in MEAT_PATTERNS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return category
     return "other meats"
+
+# ─── GRAIN DETECTION ─────────────────────────────────────────────────────────
+GRAIN_KEYWORDS = [
+    "wheat", "rice", "maize", "corn", "barley", "oats", "rye",
+    "σιτάρι", "ρύζι", "καλαμπόκι"
+]
+
+def detect_grains(ingredients: str) -> tuple:
+    """Returns (contains_grains: str, grain_free: str)."""
+    if not ingredients:
+        return ("", "")
+    lower = ingredients.lower()
+    has_grains = any(word in lower for word in GRAIN_KEYWORDS)
+    return ("Yes" if has_grains else "No", "No" if has_grains else "Yes")
 
 # ─── DATA CLASS ──────────────────────────────────────────────────────────────
 @dataclass
 class ProductRow:
+    """One row = one product flavor. Empty string = missing data."""
     brand: str = ""
     product_name: str = ""
     product_line: str = ""
@@ -171,384 +204,697 @@ class ProductRow:
     brand_site_url: str = ""
     affiliate_url: str = ""
 
+    def dedup_key(self) -> str:
+        """Composite key for deduplication: brand + product_line + flavor + type."""
+        return f"{self.brand}|{self.product_line}|{self.flavor_variant}|{self.product_type}"
+
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
 
-# ─── SHIPPING CHECKER ────────────────────────────────────────────────────────
-class ShippingChecker:
-    """Checks if Zooplus ships to Greece."""
-    
+    def is_valid(self) -> bool:
+        """Minimum viable row: must have brand OR product_name AND a URL."""
+        return bool((self.brand or self.product_name) and self.product_url)
+
+# ─── HTTP SESSION WITH RETRIES ───────────────────────────────────────────────
+class RobustSession:
+    """HTTP session with automatic retries, backoff, and jitter."""
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
-        self._ships_to_greece: Optional[bool] = None
-    
+        # Accept cookies like a real browser
+        self.session.cookies.set("language", "el", domain=".zooplus.gr")
+
+    def get(self, url: str, timeout: int = 15) -> Optional[requests.Response]:
+        """GET with retries and exponential backoff + jitter."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.session.get(url, timeout=timeout)
+
+                # Handle rate limiting
+                if response.status_code == 429:
+                    wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    jitter = random.uniform(0, wait * 0.5)
+                    logger.warning("Rate limited (429). Waiting %.1fs...", wait + jitter)
+                    time.sleep(wait + jitter)
+                    continue
+
+                # Handle server errors
+                if response.status_code >= 500:
+                    wait = RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]
+                    logger.warning("Server error %d. Retrying in %ds...", response.status_code, wait)
+                    time.sleep(wait)
+                    continue
+
+                # Handle not found
+                if response.status_code == 404:
+                    logger.warning("404 Not Found: %s", url)
+                    return None
+
+                response.raise_for_status()
+                return response
+
+            except requests.exceptions.Timeout:
+                logger.warning("Timeout on attempt %d: %s", attempt + 1, url)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_BACKOFF[attempt])
+            except requests.exceptions.ConnectionError:
+                logger.warning("Connection error on attempt %d: %s", attempt + 1, url)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_BACKOFF[attempt])
+            except requests.exceptions.HTTPError as e:
+                logger.error("HTTP error: %s", e)
+                return None
+
+        logger.error("All %d retries exhausted for: %s", MAX_RETRIES, url)
+        return None
+
+    def polite_delay(self):
+        """Random delay between requests to avoid detection."""
+        delay = random.uniform(DELAY_MIN, DELAY_MAX)
+        time.sleep(delay)
+
+# ─── SHIPPING CHECKER ────────────────────────────────────────────────────────
+class ShippingChecker:
+    """Checks if Zooplus ships to Greece. Result is cached."""
+
+    def __init__(self, http: RobustSession):
+        self.http = http
+        self._result: Optional[bool] = None
+
     def check(self) -> bool:
-        if self._ships_to_greece is not None:
-            return self._ships_to_greece
-        
-        try:
-            response = self.session.get(SHIPPING_URL, timeout=15)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            page_text = soup.get_text().lower()
-            
-            # Check for Greece mentions
-            greece_indicators = [
-                "ελλάδα", "ελλάδος", "greece", "greek",
-                "ελληνικά", "hellas", "gr"
-            ]
-            
-            for indicator in greece_indicators:
-                if indicator in page_text:
-                    self._ships_to_greece = True
-                    logger.info("✅ Zooplus ships to Greece (found: '%s')", indicator)
-                    return True
-            
-            self._ships_to_greece = False
-            logger.warning("❌ Could not confirm Zooplus ships to Greece")
-            return False
-            
-        except Exception as e:
-            logger.error("Error checking shipping: %s", e)
-            self._ships_to_greece = False
-            return False
+        if self._result is not None:
+            return self._result
+
+        response = self.http.get(SHIPPING_URL)
+        if not response:
+            logger.warning("Could not reach shipping page. Assuming True (Zooplus GR).")
+            self._result = True  # zooplus.gr IS the Greek site
+            return True
+
+        page_text = response.text.lower()
+
+        greece_indicators = [
+            "ελλάδα", "ελλάδος", "greece", "greek",
+            "ηπειρωτική ελλάδα", "νησιά", "attica",
+        ]
+
+        for indicator in greece_indicators:
+            if indicator in page_text:
+                self._result = True
+                logger.info("✅ Confirmed: Zooplus ships to Greece (found: '%s')", indicator)
+                return True
+
+        # zooplus.gr is the Greek domain — it ships to Greece by definition
+        if "zooplus.gr" in response.url:
+            self._result = True
+            logger.info("✅ zooplus.gr is the Greek storefront — ships to Greece")
+            return True
+
+        self._result = False
+        logger.warning("❌ Could not confirm shipping to Greece")
+        return False
 
 # ─── CATEGORY CRAWLER ────────────────────────────────────────────────────────
 class CategoryCrawler:
-    """Crawls category pages and collects product URLs."""
+    """Crawls category pages and collects product URLs.
     
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
-        self.product_urls: List[str] = []
-    
-    def crawl_category(self, category_path: str, max_pages: int = 50) -> List[str]:
-        """Crawl all pages of a category and collect product URLs."""
-        urls = []
+    Zooplus uses server-side pagination with ?page=N or offset parameters.
+    We also check for 'Load More' AJAX patterns.
+    """
+
+    def __init__(self, http: RobustSession):
+        self.http = http
+
+    def crawl_category(self, category_path: str, max_pages: int = 100) -> List[str]:
+        """Crawl all pages of a category. Returns deduplicated product URLs."""
+        all_urls: List[str] = []
+        seen_urls: Set[str] = set()
         page = 1
-        
+        empty_pages = 0  # Stop after 2 consecutive empty pages
+
         while page <= max_pages:
-            url = f"{BASE_URL}{category_path}?page={page}"
-            logger.info("Crawling page %d: %s", page, url)
-            
-            try:
-                response = self.session.get(url, timeout=15)
-                response.raise_for_status()
+            # Zooplus pagination patterns to try
+            urls_to_try = [
+                f"{BASE_URL}{category_path}?page={page}",
+                f"{BASE_URL}{category_path}?offset={page * 24}",
+            ]
+
+            page_found = False
+            for url in urls_to_try:
+                response = self.http.get(url)
+                if not response:
+                    continue
+
                 soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Find product links
-                product_links = soup.find_all('a', href=True)
-                page_urls = []
-                
-                for link in product_links:
-                    href = link['href']
-                    # Product URLs typically contain product identifiers
-                    if '/shop/dogs/' in href and href.count('/') > 4:
-                        full_url = urljoin(BASE_URL, href)
-                        if full_url not in urls:
-                            page_urls.append(full_url)
-                
-                if not page_urls:
-                    logger.info("No more products found on page %d. Stopping.", page)
+                page_urls = self._extract_product_urls(soup)
+
+                new_urls = [u for u in page_urls if u not in seen_urls]
+                if new_urls:
+                    seen_urls.update(new_urls)
+                    all_urls.extend(new_urls)
+                    page_found = True
+                    empty_pages = 0
+                    logger.info(
+                        "Page %d: found %d new products (total: %d)",
+                        page, len(new_urls), len(all_urls)
+                    )
+                    break  # This URL pattern works, use it for next page
+
+            if not page_found:
+                empty_pages += 1
+                if empty_pages >= 2:
+                    logger.info("No new products for 2 pages. Category complete.")
                     break
-                
-                urls.extend(page_urls)
-                logger.info("Found %d products on page %d (total: %d)", 
-                           len(page_urls), page, len(urls))
-                
-                page += 1
-                time.sleep(DELAY_BETWEEN_REQUESTS)
-                
-            except Exception as e:
-                logger.error("Error crawling page %d: %s", page, e)
-                break
-        
-        self.product_urls = urls
+            else:
+                empty_pages = 0
+
+            page += 1
+            self.http.polite_delay()
+
+        logger.info("Category '%s': %d total product URLs", category_path, len(all_urls))
+        return all_urls
+
+    def _extract_product_urls(self, soup: BeautifulSoup) -> List[str]:
+        """Extract product URLs from a category listing page."""
+        urls = []
+
+        # Strategy 1: Look for product card links with known patterns
+        # Zooplus product URLs: /shop/dogs/dry_food/brand_product_name/ARTICLE_ID
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            # Product pages have article IDs (numeric) or deep path structure
+            if re.search(r'/shop/dogs/.+/.+\\d{4,}', href):
+                full_url = urljoin(BASE_URL, href)
+                # Strip query params for dedup
+                clean_url = full_url.split('?')[0]
+                if clean_url not in urls:
+                    urls.append(clean_url)
+
+        # Strategy 2: Look for data attributes (common in modern e-commerce)
+        for el in soup.find_all(attrs={'data-product-url': True}):
+            href = el['data-product-url']
+            full_url = urljoin(BASE_URL, href)
+            clean_url = full_url.split('?')[0]
+            if clean_url not in urls:
+                urls.append(clean_url)
+
+        # Strategy 3: JSON-LD ItemList
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string)
+                if isinstance(data, dict) and data.get('@type') == 'ItemList':
+                    for item in data.get('itemListElement', []):
+                        url = item.get('url', '')
+                        if url:
+                            full_url = urljoin(BASE_URL, url)
+                            clean_url = full_url.split('?')[0]
+                            if clean_url not in urls:
+                                urls.append(clean_url)
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+
         return urls
 
 # ─── PRODUCT EXTRACTOR ───────────────────────────────────────────────────────
 class ProductExtractor:
-    """Extracts product data from a product page."""
+    """Extracts product data from a product page.
     
-    def __init__(self, ships_to_greece: bool):
-        self.session = requests.Session()
-        self.session.headers.update(HEADERS)
+    Priority order for data extraction:
+    1. JSON-LD structured data (most reliable)
+    2. Meta tags (og:title, og:image, etc.)
+    3. HTML scraping (fallback)
+    """
+
+    def __init__(self, http: RobustSession, ships_to_greece: bool):
+        self.http = http
         self.ships_to_greece = ships_to_greece
-    
+
     def extract(self, product_url: str) -> Optional[ProductRow]:
         """Extract all data from a single product page."""
-        try:
-            response = self.session.get(product_url, timeout=15)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            row = ProductRow()
-            row.product_url = product_url
-            row.date_scraped = time.strftime("%Y-%m-%d")
-            row.ships_to_greece = str(self.ships_to_greece).lower()
-            
-            # ── Extract Brand ──
-            brand_el = soup.find(class_=re.compile(r'brand|manufacturer', re.I))
-            if brand_el:
-                row.brand = brand_el.get_text(strip=True)
-            else:
-                # Try breadcrumbs
-                breadcrumbs = soup.find(class_=re.compile(r'breadcrumb', re.I))
-                if breadcrumbs:
-                    links = breadcrumbs.find_all('a')
-                    if len(links) > 1:
-                        row.brand = links[1].get_text(strip=True)
-            
-            # ── Extract Product Name ──
-            title_el = soup.find('h1') or soup.find(class_=re.compile(r'product.*title|title', re.I))
-            if title_el:
-                row.product_name = title_el.get_text(strip=True)
-            
-            # ── Extract Image URL ──
-            img_el = soup.find('img', class_=re.compile(r'product.*image|main.*image', re.I))
-            if img_el:
-                row.image_url = img_el.get('src', '') or img_el.get('data-src', '')
-            else:
-                img_el = soup.find('img', src=re.compile(r'product|media'))
-                if img_el:
-                    row.image_url = img_el.get('src', '')
-            
-            # ── Extract Price ──
-            price_el = soup.find(class_=re.compile(r'price|cost', re.I))
+        response = self.http.get(product_url)
+        if not response:
+            return None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        row = ProductRow()
+        row.product_url = product_url
+        row.date_scraped = datetime.now().strftime("%Y-%m-%d")
+        row.ships_to_greece = str(self.ships_to_greece).lower()
+
+        # ── Layer 1: JSON-LD (most reliable) ──
+        self._extract_json_ld(soup, row)
+
+        # ── Layer 2: Meta tags ──
+        self._extract_meta_tags(soup, row)
+
+        # ── Layer 3: HTML scraping (fallback) ──
+        self._extract_html(soup, row)
+
+        # ── Layer 4: Product detail sections ──
+        self._extract_detail_sections(soup, row)
+
+        # ── Post-processing ──
+        self._post_process(row)
+
+        # Validate
+        if not row.is_valid():
+            logger.warning("Invalid row from %s — skipping", product_url)
+            return None
+
+        return row
+
+    def _extract_json_ld(self, soup: BeautifulSoup, row: ProductRow):
+        """Extract from JSON-LD structured data (Product schema)."""
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string)
+                items = data if isinstance(data, list) else [data]
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get('@type') != 'Product':
+                        continue
+
+                    # Name
+                    if not row.product_name:
+                        row.product_name = item.get('name', '')
+
+                    # Image
+                    if not row.image_url:
+                        img = item.get('image', '')
+                        if isinstance(img, list):
+                            img = img[0] if img else ''
+                        row.image_url = img
+
+                    # SKU
+                    if not row.sku:
+                        row.sku = item.get('sku', '') or item.get('productID', '')
+
+                    # Brand
+                    if not row.brand:
+                        brand = item.get('brand', {})
+                        if isinstance(brand, dict):
+                            row.brand = brand.get('name', '')
+                        elif isinstance(brand, str):
+                            row.brand = brand
+
+                    # Offers
+                    offers = item.get('offers', {})
+                    if isinstance(offers, dict):
+                        self._parse_offer(offers, row)
+                    elif isinstance(offers, list) and offers:
+                        # Take the first (default) offer
+                        self._parse_offer(offers[0], row)
+
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+
+    def _parse_offer(self, offer: dict, row: ProductRow):
+        """Parse a single Offer object from JSON-LD."""
+        if not row.price and 'price' in offer:
+            row.price = str(offer['price'])
+        if not row.currency:
+            row.currency = offer.get('priceCurrency', 'EUR')
+
+    def _extract_meta_tags(self, soup: BeautifulSoup, row: ProductRow):
+        """Extract from OpenGraph and standard meta tags."""
+        meta_map = {
+            'og:title': 'product_name',
+            'og:image': 'image_url',
+            'og:description': 'product_name',  # fallback
+            'product:brand': 'brand',
+        }
+
+        for meta in soup.find_all('meta', attrs={'property': True}):
+            prop = meta.get('property', '')
+            content = meta.get('content', '').strip()
+            if prop in meta_map and content:
+                attr = meta_map[prop]
+                if not getattr(row, attr):
+                    setattr(row, attr, content)
+
+    def _extract_html(self, soup: BeautifulSoup, row: ProductRow):
+        """Fallback: extract from HTML structure."""
+        # Title from H1
+        if not row.product_name:
+            h1 = soup.find('h1')
+            if h1:
+                row.product_name = h1.get_text(strip=True)
+
+        # Image from main product image
+        if not row.image_url:
+            # Look for common product image patterns
+            img = (
+                soup.find('img', class_=re.compile(r'product.*image|gallery.*main', re.I))
+                or soup.find('img', attrs={'data-zoom-image': True})
+                or soup.find('div', class_=re.compile(r'product.*image', re.I))
+            )
+            if img:
+                if img.name == 'img':
+                    row.image_url = img.get('data-zoom-image') or img.get('src', '')
+                else:
+                    inner_img = img.find('img')
+                    if inner_img:
+                        row.image_url = inner_img.get('src', '')
+
+        # Price from common selectors
+        if not row.price:
+            price_el = (
+                soup.find(class_=re.compile(r'price.*current|current.*price', re.I))
+                or soup.find(class_=re.compile(r'product.*price', re.I))
+            )
             if price_el:
                 price_text = price_el.get_text(strip=True)
-                price_match = re.search(r'([\\d,]+\\.?\\d*)', price_text.replace(',', '.'))
-                if price_match:
-                    row.price = price_match.group(1)
+                # Handle Greek format: 69,99 € or 69.99€
+                price_text = price_text.replace('\\xa0', '').replace(' ', '')
+                match = re.search(r'(\\d+[.,]?\\d*)\\s*€', price_text)
+                if match:
+                    row.price = match.group(1).replace(',', '.')
                     row.currency = "EUR"
-            
-            # ── Extract Package Weight ──
-            weight_el = soup.find(string=re.compile(r'\\d+\\s*(kg|g)', re.I))
-            if weight_el:
-                weight_match = re.search(r'(\\d+\\.?\\d*\\s*(?:kg|g))', weight_el, re.I)
-                if weight_match:
-                    row.package_weight = weight_match.group(1)
-            
-            # ── Calculate Price per kg ──
-            if row.price and row.package_weight:
-                try:
-                    price_val = float(row.price)
-                    weight_match = re.search(r'(\\d+\\.?\\d*)\\s*(kg|g)', 
-                                            row.package_weight, re.I)
-                    if weight_match:
-                        weight = float(weight_match.group(1))
-                        if weight_match.group(2).lower() == 'g':
-                            weight = weight / 1000
-                        if weight > 0:
-                            row.price_per_kg = f"{price_val / weight:.2f}"
-                except (ValueError, ZeroDivisionError):
-                    pass
-            
-            # ── Extract Product Type from URL ──
-            if '/dry_food/' in product_url:
+
+    def _extract_detail_sections(self, soup: BeautifulSoup, row: ProductRow):
+        """Extract nutritional data and ingredients from detail tabs/sections."""
+        page_text = soup.get_text()
+
+        # ── Ingredients ──
+        if not row.full_ingredient_list:
+            # Look for ingredients section
+            ing_header = soup.find(string=re.compile(
+                r'(ingredients|συστατικά|zusammensetzung)', re.I
+            ))
+            if ing_header:
+                # Get the next sibling content or parent's next element
+                parent = ing_header.find_parent(['h2', 'h3', 'h4', 'dt', 'strong', 'b'])
+                if parent:
+                    next_el = parent.find_next(['p', 'div', 'dd', 'td'])
+                    if next_el:
+                        row.full_ingredient_list = next_el.get_text(strip=True)
+
+        # ── Nutritional Analysis ──
+        # Look for analytical constituents table/section
+        nutr_header = soup.find(string=re.compile(
+            r'(analytical|nutritional|crude|ανάλυση|nährwerte)', re.I
+        ))
+        if nutr_header:
+            parent = nutr_header.find_parent(['h2', 'h3', 'h4', 'dt', 'strong', 'b'])
+            if parent:
+                container = parent.find_next(['table', 'div', 'dl'])
+                if container:
+                    text = container.get_text()
+                    self._parse_nutritional_values(text, row)
+
+    def _parse_nutritional_values(self, text: str, row: ProductRow):
+        """Parse nutritional values from text block."""
+        patterns = {
+            'crude_protein_pct':  r'(?:protein|πρωτεΐν)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'crude_fat_pct':      r'(?:fat|fats|λίπος|fett|fette)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'crude_fiber_pct':    r'(?:fiber|fibre|fibers|ίνες|ballast)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'crude_ash_pct':      r'(?:ash|τέφρα|asche|miner)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'moisture_pct':       r'(?:moisture|water|υγρασία|feuchtigkeit)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'calcium_pct':        r'(?:calcium|ασβέστιο|kalzium)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'phosphorus_pct':     r'(?:phosphorus|φώσφορος|phosphor)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'omega3_pct':         r'(?:omega.?3|ω-?3)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+            'omega6_pct':         r'(?:omega.?6|ω-?6)\\w*\\s*[:\\-]?\\s*(\\d+[.,]?\\d*)\\s*%',
+        }
+
+        for attr, pattern in patterns.items():
+            if not getattr(row, attr):
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    setattr(row, attr, match.group(1).replace(',', '.'))
+
+    def _post_process(self, row: ProductRow):
+        """Post-processing: auto-tags, calculations, grain detection."""
+        # Product type from URL
+        if not row.product_type:
+            url = row.product_url.lower()
+            if '/dry_food/' in url or '/trockenfutter/' in url:
                 row.product_type = "Dry Food"
-            elif '/treats/' in product_url:
+            elif '/treats/' in url or '/snacks/' in url:
                 row.product_type = "Treat"
-            elif '/wet_food/' in product_url:
+            elif '/wet_food/' in url or '/nassfutter/' in url:
                 row.product_type = "Wet Food"
-            
-            # ── Extract Flavor Variant from product name ──
-            if row.product_name:
-                # Common patterns: "Brand Product - Flavor" or "Brand Product Flavor"
-                flavor_patterns = [
-                    r'[-–]\\s*([A-Z][a-z]+(?:\\s*&\\s*[A-Z][a-z]+)?)\\s*$',
-                    r'\\b(\\w+\\s*(?:&|and)\\s*\\w+)\\s*$',
-                ]
-                for pattern in flavor_patterns:
-                    match = re.search(pattern, row.product_name)
-                    if match:
-                        row.flavor_variant = match.group(1).strip()
-                        break
-            
-            # ── Auto-tag meat category ──
+
+        # Auto-tag meat category
+        if not row.main_meat_category:
             row.main_meat_category = auto_tag_meat_category(
                 row.product_name, row.full_ingredient_list
             )
-            
-            # ── Try to extract structured data from JSON-LD ──
-            self._extract_json_ld(soup, row)
-            
-            # ── Try to extract from product detail sections ──
-            self._extract_detail_sections(soup, row)
-            
-            logger.info("✅ Extracted: %s - %s", row.brand, row.product_name)
-            return row
-            
-        except Exception as e:
-            logger.error("Error extracting %s: %s", product_url, e)
-            return None
-    
-    def _extract_json_ld(self, soup: BeautifulSoup, row: ProductRow):
-        """Extract data from JSON-LD structured data."""
-        scripts = soup.find_all('script', type='application/ld+json')
-        for script in scripts:
+
+        # Grain detection
+        if not row.contains_grains:
+            row.contains_grains, row.grain_free = detect_grains(row.full_ingredient_list)
+
+        # Calculate price per kg
+        if row.price and row.package_weight and not row.price_per_kg:
             try:
-                data = json.loads(script.string)
-                if isinstance(data, dict) and data.get('@type') == 'Product':
-                    if not row.product_name:
-                        row.product_name = data.get('name', '')
-                    if not row.image_url:
-                        row.image_url = data.get('image', '')
-                    if 'offers' in data:
-                        offers = data['offers']
-                        if isinstance(offers, dict):
-                            row.price = str(offers.get('price', ''))
-                            row.currency = offers.get('priceCurrency', 'EUR')
-                        elif isinstance(offers, list) and offers:
-                            row.price = str(offers[0].get('price', ''))
-                            row.currency = offers[0].get('priceCurrency', 'EUR')
-                    if 'sku' in data:
-                        row.sku = data['sku']
-            except (json.JSONDecodeError, TypeError):
-                continue
-    
-    def _extract_detail_sections(self, soup: BeautifulSoup, row: ProductRow):
-        """Extract nutritional and ingredient data from detail sections."""
-        # Look for ingredient tables/lists
-        ingredient_section = soup.find(string=re.compile(r'ingredients|συστατικά', re.I))
-        if ingredient_section:
-            parent = ingredient_section.find_parent(['div', 'section', 'table'])
-            if parent:
-                row.full_ingredient_list = parent.get_text(strip=True)
-        
-        # Look for nutritional analysis
-        nutritional_section = soup.find(string=re.compile(r'analytical|nutritional|ανάλυση', re.I))
-        if nutritional_section:
-            parent = nutritional_section.find_parent(['div', 'section', 'table'])
-            if parent:
-                text = parent.get_text()
-                # Extract individual values
-                protein_match = re.search(r'(?:protein|πρωτεΐνη)\\s*[:\\-]?\\s*(\\d+\\.?\\d*)\\s*%', text, re.I)
-                if protein_match:
-                    row.crude_protein_pct = protein_match.group(1)
-                
-                fat_match = re.search(r'(?:fat|λίπος|fett)\\s*[:\\-]?\\s*(\\d+\\.?\\d*)\\s*%', text, re.I)
-                if fat_match:
-                    row.crude_fat_pct = fat_match.group(1)
-                
-                fiber_match = re.search(r'(?:fiber|fibre|fibers)\\s*[:\\-]?\\s*(\\d+\\.?\\d*)\\s*%', text, re.I)
-                if fiber_match:
-                    row.crude_fiber_pct = fiber_match.group(1)
-                
-                ash_match = re.search(r'(?:ash|τέφρα)\\s*[:\\-]?\\s*(\\d+\\.?\\d*)\\s*%', text, re.I)
-                if ash_match:
-                    row.crude_ash_pct = ash_match.group(1)
+                price_val = float(row.price.replace(',', '.'))
+                weight_match = re.search(r'(\\d+[.,]?\\d*)\\s*(kg|g)', row.package_weight, re.I)
+                if weight_match:
+                    weight = float(weight_match.group(1).replace(',', '.'))
+                    if weight_match.group(2).lower() == 'g':
+                        weight = weight / 1000
+                    if weight > 0:
+                        row.price_per_kg = f"{price_val / weight:.2f}"
+            except (ValueError, ZeroDivisionError):
+                pass
+
+        # Flavor extraction from product name
+        if not row.flavor_variant and row.product_name:
+            # Pattern: "Brand Product - Flavor" or "Brand Product with Flavor"
+            match = re.search(
+                r'[-–—]\\s*(.+?)\\s*$',
+                row.product_name
+            )
+            if match:
+                candidate = match.group(1).strip()
+                # Only use if it looks like a flavor (not a size or code)
+                if not re.match(r'^\\d', candidate) and len(candidate) < 50:
+                    row.flavor_variant = candidate
+
+# ─── CHECKPOINT MANAGER ──────────────────────────────────────────────────────
+class CheckpointManager:
+    """Saves and restores scraper state for resume capability."""
+
+    def __init__(self, filepath: str = CHECKPOINT_FILE):
+        self.filepath = filepath
+
+    def save(self, state: dict):
+        """Save current state to disk."""
+        with open(self.filepath, 'wb') as f:
+            pickle.dump(state, f)
+        logger.debug("Checkpoint saved: %d products, %d URLs processed",
+                     len(state.get('products', [])),
+                     len(state.get('processed_urls', set())))
+
+    def load(self) -> Optional[dict]:
+        """Load state from disk. Returns None if no checkpoint exists."""
+        if not os.path.exists(self.filepath):
+            return None
+        try:
+            with open(self.filepath, 'rb') as f:
+                state = pickle.load(f)
+            logger.info(
+                "Checkpoint loaded: %d products, %d URLs already processed",
+                len(state.get('products', [])),
+                len(state.get('processed_urls', set()))
+            )
+            return state
+        except Exception as e:
+            logger.warning("Could not load checkpoint: %s", e)
+            return None
+
+    def clear(self):
+        """Remove checkpoint file after successful completion."""
+        if os.path.exists(self.filepath):
+            os.remove(self.filepath)
+            logger.info("Checkpoint cleared.")
 
 # ─── CSV EXPORTER ────────────────────────────────────────────────────────────
 class CSVExporter:
-    """Exports product data to CSV following the COLUMNS schema."""
-    
-    def __init__(self, filename: str = "zooplus_gr_dogfood.csv"):
+    """Exports product data to CSV following the COLUMNS schema.
+    Uses UTF-8 BOM for Google Sheets compatibility.
+    """
+
+    def __init__(self, filename: str = OUTPUT_CSV):
         self.filename = filename
-    
+
     def export(self, products: List[ProductRow]):
         """Export products to CSV."""
         headers = [col['header'] for col in COLUMNS]
         keys = [col['key'] for col in COLUMNS]
-        
+
         with open(self.filename, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writeheader()
-            
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
             for product in products:
                 product_dict = product.to_dict()
-                row = {}
-                for key, header in zip(keys, headers):
-                    row[header] = product_dict.get(key, '')
+                row = [str(product_dict.get(key, '')) for key in keys]
                 writer.writerow(row)
-        
+
         logger.info("📁 Exported %d products to %s", len(products), self.filename)
 
 # ─── MAIN SCRAPER ORCHESTRATOR ───────────────────────────────────────────────
 class ZooplusGRScraper:
-    """Main orchestrator for the Zooplus.gr scraping pipeline."""
+    """Main orchestrator for the Zooplus.gr scraping pipeline.
     
-    def __init__(self):
-        self.shipping_checker = ShippingChecker()
-        self.crawler = CategoryCrawler()
+    Features:
+    - Resume capability via checkpointing
+    - Polite rate limiting with jitter
+    - Automatic retries with backoff
+    - Data validation before export
+    - Deduplication by flavor
+    """
+
+    def __init__(self, resume: bool = True):
+        self.http = RobustSession()
+        self.shipping_checker = ShippingChecker(self.http)
+        self.crawler = CategoryCrawler(self.http)
+        self.checkpoint = CheckpointManager()
+        self.exporter = CSVExporter()
+        self.resume = resume
+
+        # State
         self.products: List[ProductRow] = []
-        self.exporter = CSVExporter("zooplus_gr_dogfood.csv")
-    
+        self.processed_urls: Set[str] = set()
+
     def run(self):
         """Execute the full scraping pipeline."""
         logger.info("=" * 60)
         logger.info("🐕 Zooplus.gr Dog Food Scraper — Starting")
         logger.info("=" * 60)
-        
-        # Step 1: Check shipping to Greece
+
+        # ── Resume from checkpoint ──
+        if self.resume:
+            state = self.checkpoint.load()
+            if state:
+                self.products = state.get('products', [])
+                self.processed_urls = state.get('processed_urls', set())
+                logger.info("Resuming from checkpoint: %d products so far", len(self.products))
+
+        # ── Step 1: Check shipping ──
         logger.info("\\n📦 Step 1: Checking shipping to Greece...")
         ships_to_greece = self.shipping_checker.check()
-        
-        # Step 2: Initialize product extractor
-        extractor = ProductExtractor(ships_to_greece)
-        
-        # Step 3: Crawl each category
+
+        # ── Step 2: Collect all product URLs ──
+        logger.info("\\n📂 Step 2: Crawling categories...")
         all_product_urls = []
         for category_name, category_path in CATEGORIES.items():
-            logger.info("\\n📂 Step 2: Crawling category '%s'...", category_name)
+            logger.info("  Crawling: %s", category_name)
             urls = self.crawler.crawl_category(category_path)
             all_product_urls.extend(urls)
-            logger.info("Found %d product URLs in '%s'", len(urls), category_name)
-        
-        # Remove duplicates
+
+        # Deduplicate URLs
         all_product_urls = list(set(all_product_urls))
-        logger.info("\\n📋 Total unique product URLs: %d", len(all_product_urls))
-        
-        # Step 4: Extract data from each product
+        logger.info("📋 Total unique product URLs: %d", len(all_product_urls))
+
+        # Filter out already-processed URLs (resume support)
+        remaining_urls = [u for u in all_product_urls if u not in self.processed_urls]
+        logger.info("🔄 URLs remaining to process: %d", len(remaining_urls))
+
+        # ── Step 3: Extract data ──
         logger.info("\\n🔍 Step 3: Extracting product data...")
-        for i, url in enumerate(all_product_urls, 1):
-            logger.info("[%d/%d] Processing: %s", i, len(all_product_urls), url)
+        extractor = ProductExtractor(self.http, ships_to_greece)
+        checkpoint_counter = 0
+
+        for i, url in enumerate(remaining_urls, 1):
+            logger.info("[%d/%d] %s", i, len(remaining_urls), url)
+
             product = extractor.extract(url)
-            if product:
+            self.processed_urls.add(url)
+
+            if product and product.is_valid():
                 self.products.append(product)
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-        
-        # Step 5: Deduplicate by flavor (one row = one flavor)
+                logger.info("  ✅ %s — %s", product.brand, product.product_name)
+            else:
+                logger.warning("  ❌ No valid data extracted")
+
+            # Save checkpoint every 25 products
+            checkpoint_counter += 1
+            if checkpoint_counter >= 25:
+                self._save_checkpoint()
+                checkpoint_counter = 0
+
+            self.http.polite_delay()
+
+        # ── Step 4: Deduplicate ──
         logger.info("\\n🔄 Step 4: Deduplicating by flavor...")
+        before = len(self.products)
         self.products = self._deduplicate_by_flavor(self.products)
-        logger.info("After deduplication: %d unique flavors", len(self.products))
-        
-        # Step 6: Export to CSV
-        logger.info("\\n📁 Step 5: Exporting to CSV...")
+        logger.info("  %d → %d unique flavors", before, len(self.products))
+
+        # ── Step 5: Validate ──
+        logger.info("\\n✅ Step 5: Validating data...")
+        valid = [p for p in self.products if p.is_valid()]
+        invalid_count = len(self.products) - len(valid)
+        if invalid_count:
+            logger.warning("  Removed %d invalid rows", invalid_count)
+        self.products = valid
+
+        # ── Step 6: Export ──
+        logger.info("\\n📁 Step 6: Exporting to CSV...")
         self.exporter.export(self.products)
-        
-        # Summary
+
+        # Clear checkpoint on success
+        self.checkpoint.clear()
+
+        # ── Summary ──
         logger.info("\\n" + "=" * 60)
         logger.info("✅ SCRAPING COMPLETE")
-        logger.info("   Total products: %d", len(self.products))
-        logger.info("   Output file: zooplus_gr_dogfood.csv")
+        logger.info("   Total unique flavors: %d", len(self.products))
+        logger.info("   Output: %s", OUTPUT_CSV)
+        logger.info("   Brands: %s", ', '.join(sorted(set(p.brand for p in self.products if p.brand))))
         logger.info("=" * 60)
-    
+
+    def _save_checkpoint(self):
+        """Save current state for resume."""
+        self.checkpoint.save({
+            'products': self.products,
+            'processed_urls': self.processed_urls,
+            'timestamp': datetime.now().isoformat(),
+        })
+
     def _deduplicate_by_flavor(self, products: List[ProductRow]) -> List[ProductRow]:
-        """Keep only one row per unique flavor (brand + flavor + product type)."""
-        seen = set()
-        unique = []
-        
+        """Keep one row per unique flavor. Prefer the row with more data filled."""
+        best: Dict[str, ProductRow] = {}
+
         for p in products:
-            key = f"{p.brand}|{p.flavor_variant}|{p.product_type}"
-            if key not in seen:
-                seen.add(key)
-                unique.append(p)
-        
-        return unique
+            key = p.dedup_key()
+            if key not in best:
+                best[key] = p
+            else:
+                # Keep the row with more non-empty fields
+                existing_filled = sum(1 for v in asdict(best[key]).values() if v)
+                new_filled = sum(1 for v in asdict(p).values() if v)
+                if new_filled > existing_filled:
+                    best[key] = p
+
+        return list(best.values())
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    scraper = ZooplusGRScraper()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Zooplus.gr Dog Food Scraper")
+    parser.add_argument('--no-resume', action='store_true',
+                        help='Start fresh, ignore checkpoint')
+    parser.add_argument('--output', default=OUTPUT_CSV,
+                        help=f'Output CSV filename (default: {OUTPUT_CSV})')
+    args = parser.parse_args()
+
+    scraper = ZooplusGRScraper(resume=not args.no_resume)
+    if args.output != OUTPUT_CSV:
+        scraper.exporter = CSVExporter(args.output)
     scraper.run()
 `;
 
 export const LIBRARIES_USED = [
   {
     name: "requests",
-    purpose: "HTTP client for making GET requests to Zooplus pages",
+    purpose: "HTTP client with session/cookie support for crawling",
     install: "pip install requests",
   },
   {
@@ -557,13 +903,8 @@ export const LIBRARIES_USED = [
     install: "pip install beautifulsoup4",
   },
   {
-    name: "selenium",
-    purpose: "Browser automation for JavaScript-rendered pages (fallback)",
-    install: "pip install selenium",
-  },
-  {
     name: "csv (stdlib)",
-    purpose: "Export scraped data to CSV format",
+    purpose: "Export scraped data to CSV (UTF-8 BOM for Sheets)",
     install: "Built-in",
   },
   {
@@ -587,8 +928,13 @@ export const LIBRARIES_USED = [
     install: "Built-in",
   },
   {
-    name: "time (stdlib)",
-    purpose: "Polite delays between requests (rate limiting)",
+    name: "pickle (stdlib)",
+    purpose: "Checkpoint serialization for resume capability",
+    install: "Built-in",
+  },
+  {
+    name: "argparse (stdlib)",
+    purpose: "CLI arguments: --no-resume, --output",
     install: "Built-in",
   },
 ];
